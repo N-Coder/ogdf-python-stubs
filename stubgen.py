@@ -3,7 +3,7 @@ import os
 import re
 from collections import defaultdict
 from textwrap import indent
-from typing import Dict, ClassVar
+from typing import Dict, ClassVar, Optional
 
 import sys
 from itertools import chain, count
@@ -19,8 +19,10 @@ class ParsedElement(object):
     INSTANCES: ClassVar[Dict[str, "ParsedElement"]] = {}
     NAMESPACE: ClassVar[Dict[str, "ParsedElement"]] = {}
 
-    def __init__(self, xml: Element):
+    def __init__(self, xml: Element, container: Optional["ParsedElement"]):
         self.xml = xml
+        self.container = container
+
         # TODO correctly parse detaileddescription
         brief = xml.find("briefdescription")
         if brief is not None:
@@ -46,9 +48,10 @@ class ParsedElement(object):
             return self.__dict__["qualname"]
         elif hasattr(self.container, "qualname") and hasattr(self, "name"):
             return "%s.%s" % (self.container.qualname, self.name)
-        else:
-            print(type(self).__name__, self, "doesn't know its container!", file=sys.stderr)
-            return getattr(self, "name", "???")
+        name = getattr(self, "name", None)
+        if not name or not name.startswith("ogdf"):
+            print(type(self).__name__, self, "doesn't know its qualname/containing namespace!", file=sys.stderr)
+        return name or "???"
 
     @qualname.setter
     def qualname(self, value):
@@ -73,14 +76,14 @@ class ParsedElement(object):
 
 
 class Param(ParsedElement):
-    def __init__(self, xml: Element):
-        super().__init__(xml)
+    def __init__(self, xml: Element, container: Optional[ParsedElement]):
+        super().__init__(xml, container)
         name = xml.find("declname")
         if name is not None:
             self.name = name.text
         else:
             self.name = "_"
-        self.type = Type(xml.find("type"))
+        self.type = Type(xml.find("type"), container)
         defval = xml.find("defval")
         if defval is not None:
             if str(self.type).startswith("Callable"):
@@ -125,8 +128,8 @@ class Template(ParsedElement):
         </parameterlist>
     """
 
-    def __init__(self, xml: Element):
-        super().__init__(xml)
+    def __init__(self, xml: Element, container: Optional[ParsedElement]):
+        super().__init__(xml, container)
         elem = xml.find("declname")
         if elem is not None:
             self.name = elem.text
@@ -155,14 +158,14 @@ class Template(ParsedElement):
 
 
 class Function(ParsedElement):
-    def __init__(self, xml: Element):
-        super().__init__(xml)
+    def __init__(self, xml: Element, container: Optional[ParsedElement]):
+        super().__init__(xml, container)
         self.name = xml.find("name").text
-        self.returnt = Type(xml.find("type"))
-        self.params = [Param(p) for p in xml.iterfind("param")]
+        self.returnt = Type(xml.find("type"), container)
+        self.params = [Param(p, container) for p in xml.iterfind("param")]
         templ = xml.find("templateparamlist")
         if templ is not None:
-            self.templ = [Template(param) for param in templ.iterfind("param")]
+            self.templ = [Template(param, container) for param in templ.iterfind("param")]
         else:
             self.templ = []
         self.overloaded = False
@@ -266,10 +269,10 @@ class Function(ParsedElement):
 
 
 class Variable(ParsedElement):
-    def __init__(self, xml: Element):
-        super().__init__(xml)
+    def __init__(self, xml: Element, container: Optional[ParsedElement]):
+        super().__init__(xml, container)
         self.name = xml.find("name").text
-        self.type = Type(xml.find("type"))
+        self.type = Type(xml.find("type"), container)
         self.value = "..."
 
         self.check()
@@ -300,16 +303,15 @@ class Variable(ParsedElement):
 
 
 class Enum(ParsedElement):
-    def __init__(self, xml: Element):
-        super().__init__(xml)
-        self.qualname = str(Type(xml.find("compoundname")))
+    def __init__(self, xml: Element, container: Optional[ParsedElement]):
+        super().__init__(xml, container)
+        self.qualname = type_parse(xml.find("compoundname"), container)
         self.name = xml.find("name").text.strip()
         self.strong = xml.attrib["strong"] == "yes"
         self.values = []
         for ev in xml.iterchildren("enumvalue"):
-            v = Variable(ev)
+            v = Variable(ev, self)
             v.value = "enum.auto()"
-            v.container = self
             self.values.append(v)
 
         self.check()
@@ -329,20 +331,20 @@ class Enum(ParsedElement):
 
 
 class Class(ParsedElement):
-    def __init__(self, xml: Element):
-        super().__init__(xml)
-        self.qualname = str(Type(xml.find("compoundname")))
+    def __init__(self, xml: Element, container: Optional[ParsedElement]):
+        super().__init__(xml, container)
+        self.qualname = type_parse(xml.find("compoundname"), container)
         if "[" in self.qualname:
             print("can't handle generic args to parent of", self.qualname, file=sys.stderr)
             self.qualname, _, generic_args = self.qualname.partition("[")
         self.name = self.qualname.split(".")[-1]
-        self.bases = [Type(t) for t in xml.findall("basecompoundref")]
+        self.bases = [Type(t, self) for t in xml.findall("basecompoundref")]
         self.kind = xml.attrib["kind"]
         self.templates = set()
 
         templ = xml.find("templateparamlist")
         if templ is not None:
-            self.generic = [Template(param) for param in templ.iterfind("param")]
+            self.generic = [Template(param, container) for param in templ.iterfind("param")]
             self.templates.update(self.generic)
         else:
             self.generic = []
@@ -351,8 +353,6 @@ class Class(ParsedElement):
         self.namespace = defaultdict(list)
         self.subtypes = []
         for member in self.members:
-            if hasattr(member, "container"):
-                member.container = self
             if hasattr(member, "templ"):
                 self.templates.update(member.templ)
                 if member.name == self.name:
@@ -378,6 +378,7 @@ class Class(ParsedElement):
         ParsedElement.NAMESPACE[self.qualname] = self
 
     def do_iter(self, root: Element):
+        container = self if self.kind != "group" else self.container
         for member in root.iterchildren():
             if member.tag == "sectiondef":
                 # TODO use these sections in the sphinx file?
@@ -390,19 +391,19 @@ class Class(ParsedElement):
                 if member.attrib["prot"] == "private":
                     continue
                 if member.attrib["kind"] == "variable":
-                    yield Variable(member)
+                    yield Variable(member, container)
                 elif member.attrib["kind"] == "function":
-                    yield Function(member)
+                    yield Function(member, container)
                 elif member.attrib["kind"] == "typedef":
-                    var = Variable(member)
+                    var = Variable(member, container)
                     var.value = var.type
-                    var.type = "Type"
+                    var.type = "TypeAlias"
                     templ = member.find("templateparamlist")
                     if templ is not None:
-                        self.templates.update(Template(param) for param in templ.iterfind("param"))
+                        self.templates.update(Template(param, container) for param in templ.iterfind("param"))
                     yield var
                 elif member.attrib["kind"] == "enum":
-                    yield Enum(member)
+                    yield Enum(member, container)
                 elif member.attrib["kind"] != "friend":
                     print("can't handle", self.name, member.attrib["kind"], "member", member.attrib, file=sys.stderr)
                     UNKNOWN_MEMBER_DEFS.add(member.attrib["kind"])
@@ -410,8 +411,8 @@ class Class(ParsedElement):
                 # TODO handle?
                 continue
             elif member.tag in ["innerclass", "innernamespace"]:
-                yield Type(member)
             elif member.tag not in ["compoundname", "briefdescription", "detaileddescription", "description", "collaborationgraph", "listofallmembers",
+                yield Type(member, container)
                                     "derivedcompoundref", "basecompoundref", "inheritancegraph", "templateparamlist"]:
                 print("can't handle", self.name, "field", member.tag, member.attrib, file=sys.stderr)
                 UNKNOWN_OTHER_DEFS.add(member.tag)
@@ -456,21 +457,22 @@ class Class(ParsedElement):
 class Type(ParsedElement):
     LIST = []
 
-    def __init__(self, xml: Element):
+    def __init__(self, xml: Element, container: Optional[ParsedElement], register=True):
         self.override = ""
         self.parts = []
         self.target = None
 
         if xml is None:
-            self.xml = None
+            self.xml = self.container = self.brief = None
             return
 
-        Type.LIST.append(self)
-        super().__init__(xml)
+        if register:
+            Type.LIST.append(self)
+        super().__init__(xml, container)
 
         self.parts = [simple_parse(xml.text)]
         for t in xml.iterchildren():
-            self.parts.append(Type(t))
+            self.parts.append(Type(t, None))
             self.parts.append(simple_parse(t.tail))
         self.parts = [s for s in self.parts if s]
         if self.is_empty() == bool(self.parts):
@@ -571,6 +573,10 @@ def simple_parse(orig_name):
     name = re.sub(r"^typename\b", "", name)
 
     return name.strip()
+
+
+def type_parse(orig_name, container=None):
+    return str(Type(orig_name, container, register=False))
 
 
 if __name__ == "__main__":
