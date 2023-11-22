@@ -176,6 +176,7 @@ class Function(ParsedElement):
         super().__init__(xml, container)
         self.name = xml.find("name").text
         self.returnt = Type(xml.find("type"), container)
+        self.static = xml.attrib.get("static", "") == "yes"
         self.params = [Param(p, container) for p in xml.iterfind("param")]
         self.param_map = {}
         for param in self.params:
@@ -278,9 +279,12 @@ class Function(ParsedElement):
         #     res.append("{T} = TypeVar('{T}')".format(T=t[2].strip()))
         if self.overloaded:
             res.append("@overload")
-        params = ", ".join(chain(["self"], (str(p) for p in self.params)))
-        res.append("def {name}({params}) -> {returnt}:".format(name=self.name, params=params,
-                                                               returnt=self.returnt or "None"))
+        params = (str(p) for p in self.params)
+        if self.static:
+            res.append("@staticmethod")
+        elif self.container and self.container.is_class_like:
+            params = chain(["self"], params)
+        res.append(f"def {self.name}({', '.join(params)}) -> {self.returnt or 'None'}:")
         if self.brief:
             res.append('\t"""%s"""' % self.brief)
         res.append('\t...')
@@ -449,6 +453,10 @@ class Class(ParsedElement):
                 print("can't handle", self.name, "field", member.tag, member.attrib, file=sys.stderr)
                 UNKNOWN_OTHER_DEFS.add(member.tag)
 
+    @property
+    def is_class_like(self):
+        return self.kind not in {"namespace", "group"}
+
     def __str__(self):
         res = [f"# {self.kind} {self.qualname} ({self.xml.attrib['id']})"]
         all = []
@@ -465,7 +473,7 @@ class Class(ParsedElement):
 
         ind = ""
         res.extend(str(t) for t in self.templates)
-        if self.kind not in {"namespace", "group"}:
+        if self.is_class_like:
             bases = [str(b) for b in self.bases]
             if self.generic:
                 bases.append("Generic[%s]" % ", ".join(g.name for g in self.generic))
