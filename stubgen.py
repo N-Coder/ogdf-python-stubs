@@ -14,6 +14,7 @@ Element = etree._Element
 
 UNKNOWN_MEMBER_DEFS = set()
 UNKNOWN_OTHER_DEFS = set()
+UNRESOLVED_REFS = defaultdict(set)
 
 
 class ParsedElement(object):
@@ -430,12 +431,20 @@ class Class(ParsedElement):
                 elif member.attrib["kind"] != "friend":
                     print("can't handle", self.name, member.attrib["kind"], "member", member.attrib, file=sys.stderr)
                     UNKNOWN_MEMBER_DEFS.add(member.attrib["kind"])
+            elif member.tag == "member":
+                ref = ParsedElement.INSTANCES.get(member.attrib["refid"], None)
+                if not ref:
+                    print("could not resolve", self.qualname, "member ref", member.attrib["refid"], file=sys.stderr)
+                    continue
+                ref.container = self
+                yield ref
             elif member.tag in ["location", "includes"]:
                 # TODO handle?
                 continue
             elif member.tag in ["innerclass", "innernamespace"]:
-            elif member.tag not in ["compoundname", "briefdescription", "detaileddescription", "description", "collaborationgraph", "listofallmembers",
                 yield Type(member, container)
+            elif member.tag not in ["compoundname", "briefdescription", "detaileddescription", "description",
+                                    "collaborationgraph", "listofallmembers",
                                     "derivedcompoundref", "basecompoundref", "inheritancegraph", "templateparamlist"]:
                 print("can't handle", self.name, "field", member.tag, member.attrib, file=sys.stderr)
                 UNKNOWN_OTHER_DEFS.add(member.tag)
@@ -455,8 +464,8 @@ class Class(ParsedElement):
         res.append("__all__ = %r" % all)
 
         ind = ""
-        if self.kind != "namespace":
-            res.extend(str(t) for t in self.templates)
+        res.extend(str(t) for t in self.templates)
+        if self.kind not in {"namespace", "group"}:
             bases = [str(b) for b in self.bases]
             if self.generic:
                 bases.append("Generic[%s]" % ", ".join(g.name for g in self.generic))
@@ -475,6 +484,38 @@ class Class(ParsedElement):
         if not self.members:
             res.append(ind + "...")
         return "\n\n".join(res)
+
+
+def handle_group(root: Element):
+    for member in root.iterchildren():
+        if member.tag == "sectiondef":
+            handle_group(member)
+        elif member.tag == "memberdef":
+            if member.attrib["prot"] == "private":
+                continue
+            if member.attrib["kind"] == "define":
+                continue  # TODO handle
+
+            if member.attrib["kind"] == "variable":
+                obj = Variable(member, None)
+            elif member.attrib["kind"] == "function":
+                obj = Function(member, None)
+            elif member.attrib["kind"] == "typedef":
+                obj = Variable(member, None)
+                obj.value = obj.type
+                obj.type = "TypeAlias"
+            elif member.attrib["kind"] == "enum":
+                obj = Enum(member, None)
+            elif member.attrib["kind"] != "friend":
+                print("can't handle group", member.attrib["kind"], "member", member.attrib, file=sys.stderr)
+                UNKNOWN_MEMBER_DEFS.add(member.attrib["kind"])
+
+        elif member.tag not in ["location", "includes", "innerclass", "innernamespace", "innergroup", "title", "header",
+                                "compoundname", "briefdescription", "detaileddescription", "description",
+                                "collaborationgraph", "listofallmembers",
+                                "derivedcompoundref", "basecompoundref", "inheritancegraph", "templateparamlist"]:
+            print("can't handle group field", member.tag, member.attrib, file=sys.stderr)
+            UNKNOWN_OTHER_DEFS.add(member.tag)
 
 
 class Type(ParsedElement):
@@ -533,16 +574,28 @@ class Type(ParsedElement):
         return True
 
     def resolve(self):
-        if self.is_empty(): return
+        if self.is_empty() or self.target: return
         for p in self.parts:
             if hasattr(p, "resolve"):
                 p.resolve()
         # if self.xml.tag == "ref":
-        self.target = ParsedElement.INSTANCES.get(self.xml.attrib.get("refid", ""), None)
+        refid = self.xml.attrib.get("refid", "").strip()
+        if refid and refid not in ParsedElement.INSTANCES:
+            # print("could not resolve ref", refid, "of Type", self, file=sys.stderr)
+            UNRESOLVED_REFS[str(self)].add(refid)
+        self.target = ParsedElement.INSTANCES.get(refid, None)
         if not self.target and self.parts:
             qn = getattr(self.parts[0], "qualname", None)
             if qn in ParsedElement.NAMESPACE:  # FIXME
                 self.target = ParsedElement.NAMESPACE[qn]
+        if not self.target:
+            self.target = self.NAMESPACE.get(str(self), self.target)
+
+    def qualname(self):
+        if self.target:
+            return self.target.qualname
+        else:
+            return super().qualname
 
     def is_resolvable(self):
         self.resolve()
@@ -565,6 +618,20 @@ class Type(ParsedElement):
         if self.parts:
             return "".join(str(p) for p in self.parts)
         return "Any"
+
+    def __repr__(self):
+        fields = [str(self)]
+        if self.override:
+            fields.append(f"override={self.override!r}")
+        if self.target:
+            fields.append(f"target={self.target.qualname!r}")
+        if self.parts:
+            fields.append(f"parts={self.parts!r}")
+        if self.container:
+            fields.append(f"container={self.container.qualname!r}")
+
+        fields.append(f"xml={super().__repr__()!r}")
+        return f"{self.__class__.__name__}({', '.join(fields)})"
 
 
 def parse_default(xml):
@@ -614,17 +681,22 @@ if __name__ == "__main__":
 
     STUB_DIR = "stubs/ogdf_python/"
 
+    for group in DOXYGEN_DATA["group"].values():
+        file_in = "%s/%s.xml" % (DOXYGEN_XML_DIR, group["refid"])
+        handle_group(etree.parse(file_in).find("compounddef"))
+
     compounds = []
-    for l in ["class", "struct", "namespace"]:
-        for clazz in DOXYGEN_DATA[l].values():
+    for typ in ["class", "struct", "namespace"]:
+        for clazz in DOXYGEN_DATA[typ].values():
             if not clazz["name"].startswith("ogdf"): continue
             file_in = "%s/%s.xml" % (DOXYGEN_XML_DIR, clazz["refid"])
             compound_xml: Element = etree.parse(file_in)
             compounddef: Element = compound_xml.find("compounddef")
             if compounddef.attrib.get("prot", "") == "private": continue
-            compounds.append(Class(compounddef))
+            compounds.append(Class(compounddef, None))
 
     for parsed in compounds:
+
         parsed.resolve()
         if parsed.xml.find("innerclass") is not None:
             file_out = STUB_DIR + parsed.qualname.replace(".", "/") + "/__init__.pyi"
@@ -640,6 +712,7 @@ if __name__ == "__main__":
             print(file=f)
             print(parsed, file=f)
         # sh.mypy(f)
+        # sh.black(f)
 
     from pprint import pprint
 
@@ -647,7 +720,8 @@ if __name__ == "__main__":
     pprint(UNKNOWN_MEMBER_DEFS)
     print("UNKNOWN_OTHER_DEFS")
     pprint(UNKNOWN_OTHER_DEFS)
-    print("Type LIST")
-    pprint({str(t): repr(t) for t in Type.LIST if not t.is_resolvable()}, width=300)
-
-    sh.black("./stubs/")
+    print("UNRESOLVED_REFS")
+    pprint(UNRESOLVED_REFS)
+    # print("UNRESOLVABLE")
+    UNRESOLVABLE = {str(t): t for t in Type.LIST if not t.is_resolvable()}
+    # pprint(UNRESOLVABLE, width=300)
