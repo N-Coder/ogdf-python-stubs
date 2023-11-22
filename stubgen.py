@@ -8,6 +8,7 @@ from typing import Dict, ClassVar, Optional
 import sys
 from itertools import chain, count
 from lxml import etree
+import warnings
 
 Element = etree._Element
 
@@ -62,15 +63,22 @@ class ParsedElement(object):
 
     def check(self):
         for i in count(1):
+            val = None
             try:
                 val = str(self)
-                ast.parse(val)
+                with warnings.catch_warnings(record=True) as ws:
+                    ast.parse(val)
+                if ws:
+                    print("%s '%s':%s" % (self.__class__.__name__,
+                                          self.qualname, indent("\n".join(map(str, ws)), " - ")),
+                          file=sys.stderr)
+                    print(indent(val, "\t"), file=sys.stderr)
                 break
             except Exception as e:
                 if hasattr(self, "fix%s" % i):
                     getattr(self, "fix%s" % i)()
                 else:
-                    print("%s '%s': %s" % (self.__class__.__name__, self.name, e), file=sys.stderr)
+                    print("%s '%s': %s" % (self.__class__.__name__, self.qualname, e), file=sys.stderr)
                     print(val, file=sys.stderr)
                     raise
 
