@@ -25,14 +25,19 @@ class ParsedElement(object):
         self.container = container
 
         # TODO correctly parse detaileddescription
-        brief = xml.find("briefdescription")
-        if brief is not None:
-            self.brief = "".join(t.strip() for t in brief.itertext())
+        self.brief = xml.find("briefdescription")
+        if self.brief is not None:
+            self.brief = "".join(t.strip() for t in self.brief.itertext())
             self.brief = " ".join(t.strip() for t in self.brief.splitlines())
+            self.brief = self.brief.replace("\\", "\\\\")
+
         id = xml.attrib.get("id", "")
         if id:
             ParsedElement.INSTANCES[id] = self
-        self.container = None
+
+        qualifiedname = xml.find("qualifiedname")
+        if qualifiedname is not None and qualifiedname.text:
+            self.qualname = simple_parse(qualifiedname.text)
 
     def __eq__(self, other):
         return str(self) == str(other)
@@ -41,7 +46,7 @@ class ParsedElement(object):
         return hash(str(self))
 
     def __repr__(self):
-        return etree.tostring(self.xml, pretty_print=True).decode()
+        return etree.tostring(self.xml, pretty_print=True).decode().strip()
 
     @property
     def qualname(self):
@@ -171,6 +176,11 @@ class Function(ParsedElement):
         self.name = xml.find("name").text
         self.returnt = Type(xml.find("type"), container)
         self.params = [Param(p, container) for p in xml.iterfind("param")]
+        self.param_map = {}
+        for param in self.params:
+            while param.name in self.param_map:
+                param.name += "_"
+            self.param_map[param.name] = param
         templ = xml.find("templateparamlist")
         if templ is not None:
             self.templ = [Template(param, container) for param in templ.iterfind("param")]
@@ -288,10 +298,15 @@ class Variable(ParsedElement):
     def resolve(self):
         if hasattr(self.type, "resolve"):
             self.type.resolve()
+        if hasattr(self.value, "resolve"):
+            self.value.resolve()
         ParsedElement.NAMESPACE[self.qualname] = self
 
     def fix1(self):
-        self.name = "_" + self.name
+        if not self.name:
+            self.name = "_UNNAMED_"
+        else:
+            self.name = "_" + self.name
 
     def fix2(self):
         self.name = re.sub("[^a-zA-Z]", "", self.name[1:])
@@ -373,7 +388,7 @@ class Class(ParsedElement):
         for name, members in self.namespace.items():
             if len(members) > 1:
                 for member in members:
-                    member.overloaded = True
+                    member.overloaded = True  # FIXME overloads need to be sorted together
 
         self.check()
 
@@ -426,13 +441,13 @@ class Class(ParsedElement):
                 UNKNOWN_OTHER_DEFS.add(member.tag)
 
     def __str__(self):
-        res = []
+        res = [f"# {self.kind} {self.qualname} ({self.xml.attrib['id']})"]
         all = []
         for st in self.subtypes:
             if not st: continue
-            stn = str(st).split("[")[0]
+            stn = "ogdf_python." + str(st).split("[")[0]
             res.append("from %s import *" % stn)
-            all.append(stn.removeprefix(self.qualname + "."))
+            all.append(stn.removeprefix("ogdf_python." + self.qualname + "."))
         if self.kind == "namespace":
             all.extend(self.namespace.keys())
         else:
@@ -487,16 +502,24 @@ class Type(ParsedElement):
             print("weird type", repr(self).strip(), file=sys.stderr)
 
         t = "".join(str(p) for p in self.parts)
-        conditional = re.match(r"(std\.)?conditional *\[(.*),(?P<true>.*),(?P<false>.*)\]\.type", t)
+        conditional = re.match(r"(std\.)?conditional *\[(.*),(?P<true>.*),(?P<false>.*)]\.type", t)
         if conditional:
-            self.override = "Union[%s, %s]" % (simple_parse(conditional.group("true")), simple_parse(conditional.group("false")))
-        enable_if = re.match(r"(std\.)?enable_if *\[(.*),(?P<true>.*)\]\.type", t)
+            self.override = "Union[%s, %s]" % (
+                simple_parse(conditional.group("true")), simple_parse(conditional.group("false")))
+        enable_if = re.match(r"(std\.)?enable_if *\[(.*),(?P<true>.*)]\.type", t)
         if enable_if:
-            self.override = 'Annotated[%s, "%s"]' % (enable_if.group("true"), t.replace('"', "'"))
-        if t.startswith("std.function") or t.startswith("function"):
+            self.override = 'Annotated[%s, %r]' % (enable_if.group("true"), t)
+        if t.startswith("std.function") or t.startswith("function") or "(" in t:
             self.override = "Callable"
-        if "-" in t or "@" in t or t.endswith("."):
-            self.override = 'WTF_TYPE["%s"]' % t.replace('"', "'")
+
+        self.check()
+
+    def fix1(self):
+        print("WTF_TYPE", self.parts, self.override, file=sys.stderr)
+        self.override = 'WTF_TYPE[%r]' % str(self.parts)
+
+    def fix2(self):
+        self.override = "Any"
 
     def is_empty(self):
         if self.xml is None:
@@ -505,9 +528,8 @@ class Type(ParsedElement):
             return False
         if len(self.xml) > 0:
             return False
-        if self.xml.text:
-            if self.xml.text.strip():
-                return False
+        if self.xml.text and self.xml.text.strip():
+            return False
         return True
 
     def resolve(self):
@@ -561,6 +583,8 @@ def simple_parse(orig_name):
         .replace("&", "").replace("*", "").replace("...", "").strip()  # TODO handle varargs
     name = re.sub(r"\bconst(expr)?\b", "", name)
     name = re.sub(r"\bvolatile\b", "", name)
+    name = re.sub(r"\btypename\b", "", name)
+    name = re.sub(r"\bclass\b", "", name)
 
     name = re.sub(r"\bvoid\b", "None", name)
     name = re.sub(r"\bu?int[0-9]+(_t)?\b", "int", name)
@@ -576,9 +600,7 @@ def simple_parse(orig_name):
     name = re.sub(r"\bfalse\b", "False", name)
     name = re.sub(r"\bnullptr\b", "None", name)
     name = re.sub(r"\bNULL\b", "None", name)
-
-    name = re.sub(r"^class\b", "", name)
-    name = re.sub(r"^typename\b", "", name)
+    name = re.sub(r"!", " not ", name)
 
     return name.strip()
 
